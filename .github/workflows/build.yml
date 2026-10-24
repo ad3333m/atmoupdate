@@ -29,8 +29,9 @@ jobs:
       - name: Vendor miniz (zip reader)
         run: |
           mkdir -p source
-          curl -fsSL https://raw.githubusercontent.com/richgel999/miniz/3.0.2/miniz.h -o source/miniz.h
-          curl -fsSL https://raw.githubusercontent.com/richgel999/miniz/3.0.2/miniz.c -o source/miniz.c
+          curl -fsSL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip -o /tmp/miniz.zip
+          unzip -o /tmp/miniz.zip -d /tmp/miniz
+          cp /tmp/miniz/miniz.c /tmp/miniz/miniz.h /tmp/miniz/miniz_export.h source/
 
       - name: Vendor CA bundle (for TLS verification)
         run: |
