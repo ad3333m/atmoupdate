@@ -25,11 +25,12 @@ bool ensure_dir(const std::string& dir) {
     return mkdir(dir.c_str(), 0777) == 0 || errno == EEXIST;
 }
 
-std::string sd_path(const std::string& inside_zip) {
-    // Strip any leading "./" or "/" to avoid escaping sdmc:/.
+std::string sd_path(const std::string& inside_zip, const std::string& root) {
     size_t i = 0;
     while (i < inside_zip.size() && (inside_zip[i] == '/' || inside_zip[i] == '.')) i++;
-    return "sdmc:/" + inside_zip.substr(i);
+    std::string r = root;
+    if (r.empty() || r.back() != '/') r += '/';
+    return r + inside_zip.substr(i);
 }
 
 }
@@ -51,7 +52,8 @@ bool is_zip(const std::string& path) {
     return n == 4 && hdr[0] == 'P' && hdr[1] == 'K' && hdr[2] == 0x03 && hdr[3] == 0x04;
 }
 
-bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::string& err) {
+bool extract_zip_to(const std::string& zip_path, const std::string& dest_root,
+                    const LogFn& log, std::string& err) {
     mz_zip_archive zip{};
     if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0)) {
         err = "bad zip";
@@ -63,7 +65,7 @@ bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::str
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         std::string name = st.m_filename;
         if (name.empty()) continue;
-        std::string dest = sd_path(name);
+        std::string dest = sd_path(name, dest_root);
         if (st.m_is_directory || dest.back() == '/') {
             ensure_dir(dest);
             continue;
@@ -162,6 +164,20 @@ std::string detect_hekate_version() {
         closedir(d);
     }
     return {};
+}
+
+bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::string& err) {
+    return extract_zip_to(zip_path, "sdmc:/", log, err);
+}
+
+std::string detect_firmware_version() {
+    if (R_FAILED(setsysInitialize())) return {};
+    SetSysFirmwareVersion v{};
+    Result rc = setsysGetFirmwareVersion(&v);
+    setsysExit();
+    if (R_FAILED(rc)) return {};
+    v.display_version[sizeof(v.display_version) - 1] = '\0';
+    return std::string(v.display_version);
 }
 
 std::string detect_atmosphere_version() {

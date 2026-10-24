@@ -6,7 +6,12 @@ namespace install {
 
 using LogFn = std::function<void(const std::string&)>;
 
-// Extracts zip at zip_path into sdmc:/, creating parent dirs. Returns true on success.
+// Extracts zip at zip_path into dest_root (e.g. "sdmc:/" or "sdmc:/firmware/18.1.0/"),
+// creating parent dirs. Returns true on success.
+bool extract_zip_to(const std::string& zip_path, const std::string& dest_root,
+                    const LogFn& log, std::string& err);
+
+// Shorthand for extract_zip_to(..., "sdmc:/", ...).
 bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::string& err);
 
 // Copy src to dst, creating parent dirs. Overwrites.
@@ -29,6 +34,9 @@ std::string detect_hekate_version();
 
 // Query running Atmosphère via splGetConfig(ExosphereVersion). Returns empty if not booted into AMS.
 std::string detect_atmosphere_version();
+
+// Query installed firmware (SetSysFirmwareVersion.display_version).
+std::string detect_firmware_version();
 
 // Read our own saved versions.ini key.
 std::string read_saved(const char* key);
