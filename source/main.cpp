@@ -8,6 +8,7 @@
 #include <switch.h>
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
