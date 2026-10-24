@@ -68,8 +68,35 @@ bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::str
             continue;
         }
         mkdirs_for(dest);
-        if (!mz_zip_reader_extract_to_file(&zip, i, dest.c_str(), 0)) {
-            err = "extract failed: " + name;
+        std::remove(dest.c_str());  // overwrites of large files (package3) can fail otherwise
+
+        FILE* f = std::fopen(dest.c_str(), "wb");
+        if (!f) {
+            err = "open: " + name;
+            mz_zip_reader_end(&zip);
+            return false;
+        }
+        auto* it = mz_zip_reader_extract_iter_new(&zip, i, 0);
+        if (!it) {
+            std::fclose(f); std::remove(dest.c_str());
+            err = std::string("iter: ") + name + " (" + mz_zip_get_error_string(mz_zip_get_last_error(&zip)) + ")";
+            mz_zip_reader_end(&zip);
+            return false;
+        }
+        constexpr size_t BS = 128 * 1024;
+        std::vector<unsigned char> buf(BS);
+        bool ok = true;
+        for (;;) {
+            size_t n = mz_zip_reader_extract_iter_read(it, buf.data(), buf.size());
+            if (n == 0) break;
+            if (std::fwrite(buf.data(), 1, n, f) != n) { ok = false; break; }
+        }
+        mz_zip_reader_extract_iter_free(it);
+        std::fflush(f);
+        std::fclose(f);
+        if (!ok) {
+            std::remove(dest.c_str());
+            err = "write failed: " + name;
             mz_zip_reader_end(&zip);
             return false;
         }
