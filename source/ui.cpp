@@ -604,7 +604,8 @@ void action_row(const View& v, const Card& c, int ci) {
     else if (c.kind == Kind::Firmware) {
         if (v.zone == Zone::List) label = "Download " + c.cands[std::clamp(v.fw_sel, 0, int(c.cands.size()) - 1)].version;
         else { label = "Choose a version"; primary = false; }
-    } else if (s == Status::UpToDate || s == Status::Installed) { label = "Reinstall " + latest; primary = false; }
+    } else if (s == Status::Error) label = "Try again";
+    else if (s == Status::UpToDate || s == Status::Installed) { label = "Reinstall " + latest; primary = false; }
     else if (s == Status::NotInstalled) label = "Install " + latest;
     else label = "Update to " + latest;
 
@@ -635,16 +636,16 @@ void tile(float x, float y, float w, float h, const char* label, const std::stri
         fill_rr(x, y, w, h, 22, Col{0, 0, 0, 56}, Col{0, 0, 0, 34});
         stroke_rr(x, y, w, h, 22, 1, A(kWhite, 30), A(kWhite, 10));
     }
-    text(F_Cap, label, x + 24, y + 30, kText3);
-    if (!sub.empty()) text(F_Small, sub, x + w - 24, y + 30, kText3, Right);
-    text(F_Ver, value.empty() ? "—" : value, x + 22, y + 70, kText);
+    text(F_Cap, label, x + 24, y + 27, kText3);
+    if (!sub.empty()) text(F_Small, sub, x + w - 24, y + 27, kText3, Right);
+    text(F_Ver, value.empty() ? "—" : value, x + 22, y + h - 33, kText);
 }
 
 void detail_release(const View& v, const Card& c, int ci) {
     Status s = status_of(c);
     const Candidate* latest = c.cands.empty() ? nullptr : &c.cands[0];
 
-    float ty = PY + 132, tw = (CW - 60) / 2, th = 104;
+    float ty = PY + 126, tw = (CW - 60) / 2, th = 92;
     tile(X0, ty, tw, th, "INSTALLED", c.installed, "", false);
     circle(X0 + tw + 30, ty + th / 2, 19, A(kWhite, 26));
     stroke_rr(X0 + tw + 11, ty + th / 2 - 19, 38, 38, 19, 1, A(kWhite, 60), A(kWhite, 20));
@@ -652,9 +653,9 @@ void detail_release(const View& v, const Card& c, int ci) {
     tile(X0 + tw + 60, ty, tw, th, "LATEST", latest ? latest->version : "", latest ? latest->date : "",
          s == Status::UpdateAvailable || s == Status::NotInstalled);
 
-    float ny = PY + 276;
+    float ny = PY + 248;
     text(F_Cap, "WHAT'S NEW", X0, ny, kText3);
-    float bx = X0, by = ny + 18, bw = CW, bh = BTN_Y - 28 - by;
+    float bx = X0, by = ny + 16, bw = CW, bh = BTN_Y - 22 - by;
     fill_rr(bx, by, bw, bh, 18, Col{0, 0, 0, 46}, Col{0, 0, 0, 30});
     stroke_rr(bx, by, bw, bh, 18, 1, A(kWhite, 22), A(kWhite, 8));
     if (s == Status::Checking) { text(F_Body, "Loading release notes…", bx + 22, by + 30, kText3); }
@@ -749,8 +750,13 @@ void footer(const View& v) {
         x = hint(x, cy, "Y", "Refresh");
         hint(x, cy, "+", "Exit");
     } else {
+        const Card& c = v.cards[v.sel];
+        Status s = status_of(c);
         x = dpad_hint(x, cy, "Navigate");
-        x = hint(x, cy, "A", v.cards[v.sel].kind == Kind::Firmware ? "Choose" : "Update");
+        if (c.kind == Kind::Firmware) x = hint(x, cy, "A", "Choose");
+        else if (s == Status::RebootPending) x = hint(x, cy, "A", "Reboot");
+        else if (s != Status::Checking && s != Status::Downloading && s != Status::Installing && !c.cands.empty())
+            x = hint(x, cy, "A", "Update");
         x = hint(x, cy, "Y", "Refresh");
         hint(x, cy, "+", "Exit");
     }
