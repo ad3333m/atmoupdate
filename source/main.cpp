@@ -9,6 +9,7 @@
 #include <curl/curl.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
@@ -24,19 +25,18 @@ constexpr int kH = 720;
 
 struct Card {
     const char* title;
-    const char* repo;              // owner/repo
-    const char* saved_key;         // key in versions.ini
-    const char* asset_prefix;      // name prefix for the zip we want
-    const char* asset_contains;    // additional substring filter (optional, nullable)
+    const char* repo;
+    const char* saved_key;
+    const char* asset_prefix;
+    const char* asset_contains;
 
-    // Live state (worker + main share, guarded by lock).
     std::string installed;
     std::string latest;
-    std::string status;            // "Up to date" / "Update available" / "Downloading..." etc.
+    std::string status;
     std::string err;
     std::string zip_url;
     std::string zip_name;
-    double progress = 0.0;         // 0..1 for downloads
+    double progress = 0.0;
     bool busy = false;
     bool need_refresh = true;
     bool want_update = false;
@@ -56,10 +56,18 @@ std::mutex g_mu;
 std::condition_variable g_cv;
 std::atomic<bool> g_quit{false};
 
+TTF_Font* g_font_hero  = nullptr;
 TTF_Font* g_font_big   = nullptr;
 TTF_Font* g_font_med   = nullptr;
 TTF_Font* g_font_small = nullptr;
+TTF_Font* g_font_tiny  = nullptr;
 PlFontData g_font_data;
+
+SDL_Texture* g_panel     = nullptr;
+SDL_Texture* g_panel_focus = nullptr;
+SDL_Texture* g_glow      = nullptr;
+
+// ─── drawing helpers ─────────────────────────────────────────────────────────
 
 SDL_Texture* text_tex(SDL_Renderer* r, TTF_Font* f, const std::string& s, SDL_Color c, int* w, int* h) {
     if (s.empty()) { if (w) *w = 0; if (h) *h = 0; return nullptr; }
@@ -81,63 +89,177 @@ void draw_text(SDL_Renderer* r, TTF_Font* f, const std::string& s, int x, int y,
     SDL_DestroyTexture(t);
 }
 
+void draw_text_right(SDL_Renderer* r, TTF_Font* f, const std::string& s, int x_right, int y, SDL_Color c) {
+    int w = 0, h = 0;
+    SDL_Texture* t = text_tex(r, f, s, c, &w, &h);
+    if (!t) return;
+    SDL_Rect dst{x_right - w, y, w, h};
+    SDL_RenderCopy(r, t, nullptr, &dst);
+    SDL_DestroyTexture(t);
+}
+
 void fill_rect(SDL_Renderer* r, SDL_Rect rect, SDL_Color c) {
     SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_RenderFillRect(r, &rect);
 }
 
-void stroke_rect(SDL_Renderer* r, SDL_Rect rect, SDL_Color c) {
-    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-    SDL_RenderDrawRect(r, &rect);
+// Software-generate a translucent rounded glass panel with soft inner highlight + border.
+SDL_Texture* build_panel(SDL_Renderer* r, int w, int h, int radius, SDL_Color border) {
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    SDL_LockSurface(s);
+    Uint32* px = static_cast<Uint32*>(s->pixels);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            // Nearest corner distance (for rounded alpha).
+            double dist_outside = 0.0;
+            bool in_corner_zone = false;
+            int cx = x, cy = y;
+            if (x < radius && y < radius)            { cx = radius; cy = radius; in_corner_zone = true; }
+            else if (x >= w - radius && y < radius)  { cx = w - radius - 1; cy = radius; in_corner_zone = true; }
+            else if (x < radius && y >= h - radius)  { cx = radius; cy = h - radius - 1; in_corner_zone = true; }
+            else if (x >= w - radius && y >= h - radius) { cx = w - radius - 1; cy = h - radius - 1; in_corner_zone = true; }
+            double d = 0.0;
+            if (in_corner_zone) {
+                double dx = x - cx, dy = y - cy;
+                d = std::sqrt(dx*dx + dy*dy);
+                dist_outside = d - radius;
+            }
+
+            // Edge-of-rect proximity for straight sides.
+            int edge_px = std::min({x, y, w - 1 - x, h - 1 - y});
+
+            // Alpha of the whole panel at this pixel (soft AA on rounded edge).
+            double coverage = 1.0;
+            if (in_corner_zone) {
+                if (dist_outside > 0.5) coverage = 0.0;
+                else if (dist_outside > -0.5) coverage = 0.5 - dist_outside;
+            }
+            if (coverage <= 0.0) { px[y*w + x] = 0; continue; }
+
+            // Vertical gradient for the fill: brighter at top for a glass highlight.
+            double v = static_cast<double>(y) / h;
+            double top_boost = std::exp(-v * 4.0);          // 1→~0.02 top→bottom
+            Uint8 base = static_cast<Uint8>(22 + top_boost * 22);     // 44 at top, 22 at bottom
+            Uint8 fill_r = 255, fill_g = 255, fill_b = 255;
+
+            // Border detection: within 1.4 px of the rounded perimeter.
+            bool on_border = false;
+            if (in_corner_zone) {
+                if (dist_outside > -1.4 && dist_outside <= 0.0) on_border = true;
+            } else {
+                if (edge_px <= 1) on_border = true;
+            }
+
+            Uint8 R, G, B, A;
+            if (on_border) {
+                R = border.r; G = border.g; B = border.b;
+                A = static_cast<Uint8>(border.a * coverage);
+            } else {
+                R = fill_r; G = fill_g; B = fill_b;
+                A = static_cast<Uint8>(base * coverage);
+            }
+            px[y*w + x] = (Uint32(A) << 24) | (Uint32(R) << 16) | (Uint32(G) << 8) | Uint32(B);
+        }
+    }
+    SDL_UnlockSurface(s);
+    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+    SDL_FreeSurface(s);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
 }
 
-void draw_background(SDL_Renderer* r) {
-    for (int y = 0; y < kH; y++) {
-        int t = (y * 255) / kH;
-        SDL_SetRenderDrawColor(r, 10 + t / 10, 14 + t / 8, 28 + t / 5, 255);
-        SDL_RenderDrawLine(r, 0, y, kW, y);
+// Soft radial glow blob (used for background depth).
+SDL_Texture* build_glow(SDL_Renderer* r, int size) {
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, size, size, 32, SDL_PIXELFORMAT_ARGB8888);
+    SDL_LockSurface(s);
+    Uint32* px = static_cast<Uint32*>(s->pixels);
+    double cx = size / 2.0, cy = size / 2.0;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            double dx = x - cx, dy = y - cy;
+            double d = std::sqrt(dx*dx + dy*dy) / cx;
+            double a = std::max(0.0, 1.0 - d);
+            a = a * a * a;                   // steeper falloff
+            Uint8 A = static_cast<Uint8>(a * 255);
+            px[y*size + x] = (Uint32(A) << 24) | 0x00FFFFFF;
+        }
     }
-    // Subtle accent glow
-    for (int i = 0; i < 180; i++) {
-        SDL_Color c{80, 130, 255, (Uint8)(40 - i / 5)};
-        if (c.a == 0) break;
-        SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_Rect gr{kW / 2 - 400 - i, 60 - i, 800 + 2*i, 10 + 2*i};
-        SDL_RenderDrawRect(r, &gr);
+    SDL_UnlockSurface(s);
+    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+    SDL_FreeSurface(s);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
+}
+
+void draw_background(SDL_Renderer* r, Uint32 ticks) {
+    // Deep navy vertical gradient fills the whole output.
+    int ow, oh;
+    SDL_GetRendererOutputSize(r, &ow, &oh);
+    for (int y = 0; y < oh; y++) {
+        double v = double(y) / oh;
+        Uint8 R = static_cast<Uint8>(6  + v * 10);
+        Uint8 G = static_cast<Uint8>(10 + v * 14);
+        Uint8 B = static_cast<Uint8>(28 + v * 32);
+        SDL_SetRenderDrawColor(r, R, G, B, 255);
+        SDL_RenderDrawLine(r, 0, y, ow, y);
+    }
+    // Two slow-drifting glow blobs.
+    if (g_glow) {
+        double t = ticks / 1000.0;
+        SDL_SetTextureColorMod(g_glow, 90, 140, 255);
+        SDL_SetTextureAlphaMod(g_glow, 110);
+        int sz = 1000;
+        SDL_Rect a{int(-200 + std::sin(t * 0.4) * 60),
+                   int(-200 + std::cos(t * 0.3) * 60), sz, sz};
+        SDL_RenderCopy(r, g_glow, nullptr, &a);
+
+        SDL_SetTextureColorMod(g_glow, 180, 100, 220);
+        SDL_SetTextureAlphaMod(g_glow, 90);
+        SDL_Rect b{int(ow - 800 + std::sin(t * 0.25) * 50),
+                   int(oh - 600 + std::cos(t * 0.35) * 50), sz, sz};
+        SDL_RenderCopy(r, g_glow, nullptr, &b);
     }
 }
 
-void draw_glass(SDL_Renderer* r, SDL_Rect rect, bool focused) {
-    // outer soft shadow
-    for (int i = 10; i > 0; i--) {
-        SDL_Color sh{0, 0, 0, (Uint8)(16 - i)};
-        SDL_Rect gr{rect.x - i, rect.y - i, rect.w + 2*i, rect.h + 2*i};
-        stroke_rect(r, gr, sh);
+void draw_panel(SDL_Renderer* r, SDL_Rect rect, bool focus) {
+    // Soft drop shadow.
+    if (g_panel) {
+        SDL_SetTextureColorMod(g_panel, 0, 0, 0);
+        SDL_SetTextureAlphaMod(g_panel, 90);
+        SDL_Rect sh{rect.x - 4, rect.y + 10, rect.w + 8, rect.h + 10};
+        SDL_RenderCopy(r, g_panel, nullptr, &sh);
+        SDL_SetTextureColorMod(g_panel, 255, 255, 255);
+        SDL_SetTextureAlphaMod(g_panel, 255);
     }
-    // base translucent fill
-    fill_rect(r, rect, SDL_Color{255, 255, 255, 18});
-    // top highlight band
-    SDL_Rect top{rect.x, rect.y, rect.w, 36};
-    fill_rect(r, top, SDL_Color{255, 255, 255, 14});
-    // border
-    stroke_rect(r, rect, focused ? SDL_Color{140, 190, 255, 230} : SDL_Color{255, 255, 255, 70});
-    if (focused) {
-        SDL_Rect inner{rect.x + 1, rect.y + 1, rect.w - 2, rect.h - 2};
-        stroke_rect(r, inner, SDL_Color{140, 190, 255, 120});
+    SDL_Texture* tex = focus ? g_panel_focus : g_panel;
+    if (tex) SDL_RenderCopy(r, tex, nullptr, &rect);
+}
+
+void draw_pill(SDL_Renderer* r, int x, int y, const std::string& text, SDL_Color dot, SDL_Color fg) {
+    int tw = 0, th = 0;
+    SDL_Texture* tx = text_tex(r, g_font_small, text, fg, &tw, &th);
+    int pad_x = 14, pad_y = 6;
+    SDL_Rect bg{x, y, tw + pad_x * 2 + 20, th + pad_y * 2};
+    fill_rect(r, bg, SDL_Color{255, 255, 255, 20});
+    // dot
+    fill_rect(r, SDL_Rect{x + pad_x, y + pad_y + th/2 - 5, 10, 10}, dot);
+    if (tx) {
+        SDL_Rect dst{x + pad_x + 20, y + pad_y, tw, th};
+        SDL_RenderCopy(r, tx, nullptr, &dst);
+        SDL_DestroyTexture(tx);
     }
 }
 
 void draw_progress(SDL_Renderer* r, SDL_Rect rect, double p) {
-    fill_rect(r, rect, SDL_Color{255, 255, 255, 24});
-    SDL_Rect fill{rect.x, rect.y, (int)(rect.w * p), rect.h};
-    fill_rect(r, fill, SDL_Color{90, 180, 255, 220});
-    stroke_rect(r, rect, SDL_Color{255, 255, 255, 100});
+    fill_rect(r, rect, SDL_Color{255, 255, 255, 28});
+    SDL_Rect fill{rect.x, rect.y, int(rect.w * p), rect.h};
+    fill_rect(r, fill, SDL_Color{110, 190, 255, 240});
+    // Subtle inner highlight at top of bar.
+    SDL_Rect hi{rect.x, rect.y, rect.w, 2};
+    fill_rect(r, hi, SDL_Color{255, 255, 255, 60});
 }
 
-// Decide which asset to pick given the card's filters.
 const gh::Asset* pick_asset(const Card& c, const gh::Release& rel) {
     for (auto& a : rel.assets) {
         if (a.name.rfind(c.asset_prefix, 0) != 0) continue;
@@ -149,7 +271,6 @@ const gh::Asset* pick_asset(const Card& c, const gh::Release& rel) {
     return nullptr;
 }
 
-// Worker: handles refresh + update per-card sequentially.
 void worker() {
     while (!g_quit.load()) {
         int work_i = -1;
@@ -177,20 +298,19 @@ void worker() {
 
         Card& c = g_cards[work_i];
         if (do_refresh) {
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                c.status = "Checking…";
-                c.err.clear();
-            }
+            { std::lock_guard<std::mutex> lk(g_mu); c.status = "Checking…"; c.err.clear(); }
             gh::Release rel; std::string err;
             if (!gh::latest(c.repo, rel, err)) {
                 std::lock_guard<std::mutex> lk(g_mu);
                 c.err = err; c.status = "Error"; c.busy = false; continue;
             }
             const gh::Asset* a = pick_asset(c, rel);
+            std::string key = c.saved_key;
             std::string installed;
-            if (std::string(c.saved_key) == "hekate") installed = install::detect_hekate_version();
+            if (key == "atmosphere") installed = install::detect_atmosphere_version();
+            else if (key == "hekate") installed = install::detect_hekate_version();
             if (installed.empty()) installed = install::read_saved(c.saved_key);
+
             std::string tag_norm = rel.tag;
             if (!tag_norm.empty() && (tag_norm[0] == 'v' || tag_norm[0] == 'V')) tag_norm.erase(0, 1);
             std::lock_guard<std::mutex> lk(g_mu);
@@ -227,21 +347,17 @@ void worker() {
                 std::lock_guard<std::mutex> lk(g_mu);
                 c.err = "not a zip"; c.status = "Error"; c.busy = false; continue;
             }
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                c.status = "Installing…"; c.progress = 1.0;
-            }
+            { std::lock_guard<std::mutex> lk(g_mu); c.status = "Installing…"; c.progress = 1.0; }
             install::LogFn lg = [](const std::string&) {};
             if (!install::extract_zip_to_root(tmp, lg, err)) {
                 std::lock_guard<std::mutex> lk(g_mu);
                 c.err = err; c.status = "Install failed"; c.busy = false; continue;
             }
-            // Side-effect: for hekate, mirror payload to /atmosphere/reboot_payload.bin.
             if (std::string(c.saved_key) == "hekate") {
                 std::string pay = "sdmc:/hekate_ctcaer_" + c.latest + ".bin";
                 std::string reboot = "sdmc:/atmosphere/reboot_payload.bin";
                 std::string e2;
-                install::copy_file(pay, reboot, e2);  // best-effort
+                install::copy_file(pay, reboot, e2);
             }
             install::write_saved(c.saved_key, c.latest);
             std::remove(tmp.c_str());
@@ -256,79 +372,105 @@ void worker() {
 
 void init_fonts() {
     plGetSharedFontByType(&g_font_data, PlSharedFontType_Standard);
-    g_font_big   = TTF_OpenFontRW(SDL_RWFromMem(g_font_data.address, g_font_data.size), 1, 38);
-    g_font_med   = TTF_OpenFontRW(SDL_RWFromMem(g_font_data.address, g_font_data.size), 1, 26);
-    g_font_small = TTF_OpenFontRW(SDL_RWFromMem(g_font_data.address, g_font_data.size), 1, 20);
+    auto mk = [](int px){ return TTF_OpenFontRW(SDL_RWFromMem(g_font_data.address, g_font_data.size), 1, px); };
+    g_font_hero  = mk(48);
+    g_font_big   = mk(34);
+    g_font_med   = mk(24);
+    g_font_small = mk(20);
+    g_font_tiny  = mk(16);
 }
 
 void draw_card(SDL_Renderer* r, int idx, SDL_Rect rect) {
     Card snap;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        snap = g_cards[idx];
-    }
+    { std::lock_guard<std::mutex> lk(g_mu); snap = g_cards[idx]; }
     bool focus = (idx == g_focus);
-    draw_glass(r, rect, focus);
+    draw_panel(r, rect, focus);
 
-    SDL_Color white{235, 240, 255, 255};
-    SDL_Color dim{180, 190, 215, 255};
+    SDL_Color white{240, 244, 255, 255};
+    SDL_Color dim{170, 185, 215, 255};
     SDL_Color accent{140, 200, 255, 255};
     SDL_Color err{255, 140, 140, 255};
     SDL_Color ok{150, 230, 180, 255};
 
-    draw_text(r, g_font_big, snap.title, rect.x + 24, rect.y + 18, white);
+    int inner_x = rect.x + 32;
+    int inner_w = rect.w - 64;
 
-    int row_y = rect.y + 90;
-    draw_text(r, g_font_small, "Installed", rect.x + 24, row_y, dim);
-    draw_text(r, g_font_med, snap.installed.empty() ? "—" : snap.installed,
-              rect.x + 160, row_y - 4, white);
-    row_y += 44;
-    draw_text(r, g_font_small, "Latest", rect.x + 24, row_y, dim);
-    draw_text(r, g_font_med, snap.latest.empty() ? "—" : snap.latest,
-              rect.x + 160, row_y - 4, accent);
+    // Title row.
+    draw_text(r, g_font_big, snap.title, inner_x, rect.y + 26, white);
 
-    // Status
-    row_y += 60;
-    SDL_Color sc = white;
-    if (!snap.err.empty()) sc = err;
-    else if (snap.status == "Up to date" || snap.status == "Installed") sc = ok;
-    else if (snap.status == "Update available") sc = accent;
-    draw_text(r, g_font_med, snap.status, rect.x + 24, row_y, sc);
+    // Status pill, top-right.
+    SDL_Color dot = dim;
+    if (!snap.err.empty()) dot = err;
+    else if (snap.status == "Up to date" || snap.status == "Installed") dot = ok;
+    else if (snap.status == "Update available") dot = accent;
+    else if (snap.busy) dot = accent;
+    int pw = 0, ph = 0;
+    SDL_Texture* pt = text_tex(r, g_font_small, snap.status, white, &pw, &ph);
+    if (pt) SDL_DestroyTexture(pt);
+    draw_pill(r, rect.x + rect.w - 32 - (pw + 54), rect.y + 36, snap.status, dot, white);
+
+    // Divider.
+    SDL_Rect div{inner_x, rect.y + 92, inner_w, 1};
+    fill_rect(r, div, SDL_Color{255, 255, 255, 35});
+
+    // Version lines.
+    int ry = rect.y + 118;
+    draw_text(r, g_font_small, "Installed", inner_x, ry, dim);
+    draw_text_right(r, g_font_med, snap.installed.empty() ? "—" : snap.installed,
+                    rect.x + rect.w - 32, ry - 2, white);
+
+    ry += 46;
+    draw_text(r, g_font_small, "Latest", inner_x, ry, dim);
+    draw_text_right(r, g_font_med, snap.latest.empty() ? "—" : snap.latest,
+                    rect.x + rect.w - 32, ry - 2, accent);
+
+    // Error detail.
     if (!snap.err.empty()) {
-        draw_text(r, g_font_small, snap.err.substr(0, 60),
-                  rect.x + 24, row_y + 36, err);
+        draw_text(r, g_font_small, snap.err.substr(0, 46), inner_x, ry + 48, err);
     }
 
-    // Progress bar when downloading/installing.
+    // Progress bar when busy.
     if (snap.busy && (snap.status == "Downloading…" || snap.status == "Installing…")) {
-        SDL_Rect pb{rect.x + 24, rect.y + rect.h - 92, rect.w - 48, 14};
+        SDL_Rect pb{inner_x, rect.y + rect.h - 110, inner_w, 10};
         draw_progress(r, pb, snap.progress);
         char pct[32];
-        std::snprintf(pct, sizeof(pct), "%d%%", (int)(snap.progress * 100));
-        draw_text(r, g_font_small, pct, rect.x + rect.w - 70, rect.y + rect.h - 90 - 20, dim);
+        std::snprintf(pct, sizeof(pct), "%d%%", int(snap.progress * 100));
+        draw_text_right(r, g_font_tiny, pct, rect.x + rect.w - 32, rect.y + rect.h - 134, dim);
     }
 
-    // Button hint strip.
-    SDL_Rect btn{rect.x + 24, rect.y + rect.h - 56, rect.w - 48, 36};
-    fill_rect(r, btn, focus ? SDL_Color{90, 160, 255, 60} : SDL_Color{255, 255, 255, 20});
-    stroke_rect(r, btn, focus ? SDL_Color{150, 200, 255, 220} : SDL_Color{255, 255, 255, 70});
+    // Action button strip.
+    SDL_Rect btn{inner_x, rect.y + rect.h - 76, inner_w, 48};
+    fill_rect(r, btn, focus ? SDL_Color{110, 170, 255, 70} : SDL_Color{255, 255, 255, 22});
+    // Inner highlight.
+    fill_rect(r, SDL_Rect{btn.x, btn.y, btn.w, 1}, SDL_Color{255, 255, 255, 70});
     const char* label = "Press A to update";
     if (snap.busy) label = "Working…";
-    else if (snap.status == "Up to date") label = "A: Reinstall";
-    draw_text(r, g_font_small, label, btn.x + 14, btn.y + 7, white);
-}
-
-void draw_footer(SDL_Renderer* r) {
-    SDL_Color dim{180, 190, 215, 255};
-    draw_text(r, g_font_small, "A  Update   Y  Refresh   D-Pad  Switch   +  Exit",
-              40, kH - 36, dim);
+    else if (snap.status == "Up to date") label = "A • Reinstall";
+    else if (snap.status == "Not installed") label = "A • Install";
+    int lw = 0, lh = 0;
+    SDL_Texture* lt = text_tex(r, g_font_med, label, white, &lw, &lh);
+    if (lt) {
+        SDL_Rect dst{btn.x + (btn.w - lw)/2, btn.y + (btn.h - lh)/2, lw, lh};
+        SDL_RenderCopy(r, lt, nullptr, &dst);
+        SDL_DestroyTexture(lt);
+    }
 }
 
 void draw_header(SDL_Renderer* r) {
-    SDL_Color white{235, 240, 255, 255};
-    SDL_Color dim{160, 180, 210, 255};
-    draw_text(r, g_font_big, "AtmoUpdate", 40, 28, white);
-    draw_text(r, g_font_small, "Atmosphère & Hekate — right here on your Switch", 40, 72, dim);
+    SDL_Color white{240, 244, 255, 255};
+    SDL_Color dim{170, 185, 215, 255};
+    draw_text(r, g_font_hero, "AtmoUpdate", 60, 38, white);
+    draw_text(r, g_font_small, "Atmosphère & Hekate — on-device, no PC", 62, 100, dim);
+}
+
+void draw_footer(SDL_Renderer* r) {
+    int ow, oh; SDL_GetRendererOutputSize(r, &ow, &oh);
+    // Subtle divider line.
+    fill_rect(r, SDL_Rect{40, oh - 70, ow - 80, 1}, SDL_Color{255, 255, 255, 30});
+    SDL_Color dim{170, 185, 215, 255};
+    draw_text(r, g_font_small,
+              "A  Update   Y  Refresh   ◀ ▶  Switch card   +  Exit",
+              60, oh - 48, dim);
 }
 
 }  // namespace
@@ -340,18 +482,26 @@ int main(int, char**) {
     romfsInit();
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
     init_fonts();
 
-    SDL_Window* win = SDL_CreateWindow("AtmoUpdate", 0, 0, kW, kH, 0);
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    SDL_RenderSetLogicalSize(ren, kW, kH);
+    SDL_Window* win = SDL_CreateWindow("AtmoUpdate",
+                                       SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                       kW, kH, 0);
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1,
+                                           SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // No logical size — draw to full renderer output, so no letterbox bars.
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
-    for (int i = 0; i < 2; i++) SDL_JoystickOpen(i);
-    SDL_GameControllerOpen(0);
+    // Pre-build glass panel textures sized for one card.
+    constexpr int kCardW = 520, kCardH = 420;
+    g_panel       = build_panel(ren, kCardW, kCardH, 26, SDL_Color{255, 255, 255, 90});
+    g_panel_focus = build_panel(ren, kCardW, kCardH, 26, SDL_Color{150, 200, 255, 230});
+    g_glow        = build_glow(ren, 384);
 
+    SDL_GameControllerOpen(0);
     std::thread w(worker);
 
     PadState pad;
@@ -363,7 +513,7 @@ int main(int, char**) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         if (down & HidNpadButton_Plus) running = false;
-        if (down & (HidNpadButton_Left | HidNpadButton_StickLLeft))  g_focus = (g_focus + kN - 1) % kN;
+        if (down & (HidNpadButton_Left  | HidNpadButton_StickLLeft))  g_focus = (g_focus + kN - 1) % kN;
         if (down & (HidNpadButton_Right | HidNpadButton_StickLRight)) g_focus = (g_focus + 1) % kN;
         if (down & HidNpadButton_A) {
             std::lock_guard<std::mutex> lk(g_mu);
@@ -379,19 +529,20 @@ int main(int, char**) {
         }
 
         SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) running = false;
-        }
+        while (SDL_PollEvent(&e)) if (e.type == SDL_QUIT) running = false;
 
-        draw_background(ren);
+        int ow, oh; SDL_GetRendererOutputSize(ren, &ow, &oh);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        draw_background(ren, SDL_GetTicks());
         draw_header(ren);
-        int cw = 540, ch = 420;
-        int gap = 40;
-        int total = cw * kN + gap * (kN - 1);
-        int x0 = (kW - total) / 2;
-        int y0 = 150;
+
+        int gap = 48;
+        int total = kCardW * kN + gap * (kN - 1);
+        int x0 = (ow - total) / 2;
+        int y0 = 190;
         for (int i = 0; i < kN; i++) {
-            SDL_Rect rect{x0 + i * (cw + gap), y0, cw, ch};
+            SDL_Rect rect{x0 + i * (kCardW + gap), y0, kCardW, kCardH};
             draw_card(ren, i, rect);
         }
         draw_footer(ren);
@@ -402,9 +553,14 @@ int main(int, char**) {
     g_cv.notify_all();
     w.join();
 
-    if (g_font_big) TTF_CloseFont(g_font_big);
-    if (g_font_med) TTF_CloseFont(g_font_med);
+    if (g_panel)       SDL_DestroyTexture(g_panel);
+    if (g_panel_focus) SDL_DestroyTexture(g_panel_focus);
+    if (g_glow)        SDL_DestroyTexture(g_glow);
+    if (g_font_hero)  TTF_CloseFont(g_font_hero);
+    if (g_font_big)   TTF_CloseFont(g_font_big);
+    if (g_font_med)   TTF_CloseFont(g_font_med);
     if (g_font_small) TTF_CloseFont(g_font_small);
+    if (g_font_tiny)  TTF_CloseFont(g_font_tiny);
     TTF_Quit();
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

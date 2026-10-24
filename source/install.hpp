@@ -24,9 +24,11 @@ bool read_file(const std::string& path, std::string& out);
 // Write string to file (overwrites).
 bool write_file(const std::string& path, const std::string& content);
 
-// Scan /bootloader for installed hekate payload version (hekate_ctcaer_X.Y.Z.bin pattern).
-// Returns empty string if not found. Checks sdmc:/ as well.
+// Scan common locations for installed hekate payload version. Returns empty string if not found.
 std::string detect_hekate_version();
+
+// Query running Atmosphère via splGetConfig(ExosphereVersion). Returns empty if not booted into AMS.
+std::string detect_atmosphere_version();
 
 // Read our own saved versions.ini key.
 std::string read_saved(const char* key);

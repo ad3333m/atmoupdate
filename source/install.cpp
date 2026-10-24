@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <switch.h>
 
 namespace {
 
@@ -112,23 +113,38 @@ bool write_file(const std::string& path, const std::string& content) {
 }
 
 std::string detect_hekate_version() {
-    // Hekate's zip drops hekate_ctcaer_X.Y.Z.bin at sdmc root (and bootloader/update.bin).
-    DIR* d = opendir("sdmc:/");
-    if (!d) return {};
-    std::string hit;
-    while (auto* e = readdir(d)) {
-        std::string n = e->d_name;
-        if (n.rfind("hekate_ctcaer_", 0) == 0 && n.size() > 15 && n.substr(n.size()-4) == ".bin") {
-            std::string ver = n.substr(14, n.size() - 14 - 4);
-            // some zips name hekate_ctcaer_X.Y.Z_Nyx_A.B.C.bin — take the first _-split
-            size_t us = ver.find('_');
-            if (us != std::string::npos) ver = ver.substr(0, us);
-            hit = ver;
-            break;
+    const char* dirs[] = {"sdmc:/", "sdmc:/bootloader/", "sdmc:/payloads/", "sdmc:/switch/"};
+    for (const char* dp : dirs) {
+        DIR* d = opendir(dp);
+        if (!d) continue;
+        while (auto* e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.rfind("hekate_ctcaer_", 0) == 0 && n.size() > 18 && n.substr(n.size()-4) == ".bin") {
+                std::string ver = n.substr(14, n.size() - 14 - 4);
+                size_t us = ver.find('_');          // trim _Nyx_X.Y.Z suffix
+                if (us != std::string::npos) ver = ver.substr(0, us);
+                closedir(d);
+                return ver;
+            }
         }
+        closedir(d);
     }
-    closedir(d);
-    return hit;
+    return {};
+}
+
+std::string detect_atmosphere_version() {
+    if (R_FAILED(splInitialize())) return {};
+    u64 ver = 0;
+    Result rc = splGetConfig((SplConfigItem)65000, &ver);  // ExosphereVersion
+    splExit();
+    if (R_FAILED(rc)) return {};
+    unsigned major = (ver >> 56) & 0xff;
+    unsigned minor = (ver >> 48) & 0xff;
+    unsigned micro = (ver >> 40) & 0xff;
+    if (major == 0 && minor == 0 && micro == 0) return {};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u", major, minor, micro);
+    return buf;
 }
 
 std::string read_saved(const char* key) {
