@@ -2,6 +2,7 @@
 #include "miniz.h"
 #include <sys/stat.h>
 #include <dirent.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -68,11 +69,15 @@ bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::str
             continue;
         }
         mkdirs_for(dest);
-        std::remove(dest.c_str());  // overwrites of large files (package3) can fail otherwise
+        // Clear FAT read-only bit (atmosphere/package3 ships read-only in the zip)
+        // then remove. Both are best-effort; the open below decides success.
+        chmod(dest.c_str(), 0666);
+        std::remove(dest.c_str());
 
         FILE* f = std::fopen(dest.c_str(), "wb");
         if (!f) {
-            err = "open: " + name;
+            int saved = errno;
+            err = "open " + name + " errno=" + std::to_string(saved);
             mz_zip_reader_end(&zip);
             return false;
         }
