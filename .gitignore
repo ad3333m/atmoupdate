@@ -1,0 +1,7 @@
+build/
+*.nro
+*.elf
+*.nacp
+source/miniz.h
+source/miniz.c
+romfs/cacert.pem
