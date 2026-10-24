@@ -31,7 +31,9 @@ jobs:
           mkdir -p source
           curl -fsSL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip -o /tmp/miniz.zip
           unzip -o /tmp/miniz.zip -d /tmp/miniz
-          cp /tmp/miniz/miniz.c /tmp/miniz/miniz.h /tmp/miniz/miniz_export.h source/
+          cp /tmp/miniz/miniz.c /tmp/miniz/miniz.h source/
+          # Static build: stub the CMake-generated export header.
+          echo '#define MINIZ_EXPORT' > source/miniz_export.h
 
       - name: Vendor CA bundle (for TLS verification)
         run: |
