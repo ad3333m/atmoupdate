@@ -12,6 +12,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  preview:
+    name: UI preview screenshots
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev >/dev/null
+      - name: Build + render
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: |
+          g++ -std=c++20 -O2 -Wall -Isource tools/preview.cpp source/ui.cpp \
+            $(pkg-config --cflags --libs sdl2 SDL2_ttf SDL2_image) -o preview_bin
+          mkdir -p preview
+          ./preview_bin preview romfs/fonts/
+      # Artifact storage on this account is full, so screenshots go to a "preview" pre-release.
+      - name: Publish screenshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view preview >/dev/null 2>&1 || \
+            gh release create preview --prerelease --title "UI preview" --notes "Desktop renders of the Switch UI from CI."
+          gh release upload preview preview/*.png --clobber
+
   switch:
     name: Switch nro
     runs-on: ubuntu-latest
@@ -19,26 +45,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Portlibs
+      - name: Portlibs + payload toolchain
         run: |
           dkp-pacman -S --noconfirm --needed \
             switch-sdl2 switch-sdl2_ttf switch-freetype \
-            switch-curl switch-mbedtls switch-zlib switch-bzip2 || true
+            switch-curl switch-mbedtls switch-zlib switch-bzip2 switch-libpng || true
           $DEVKITPRO/portlibs/switch/bin/aarch64-none-elf-pkg-config --exists sdl2 SDL2_ttf libcurl
+          if [ ! -f "$DEVKITPRO/devkitARM/base_rules" ]; then
+            dkp-pacman -S --noconfirm --needed devkitARM devkitarm-rules
+          fi
+          command -v python3 >/dev/null && command -v gcc >/dev/null || \
+            (apt-get update -qq && apt-get install -y -qq python3 build-essential >/dev/null)
 
-      - name: Vendor miniz (zip reader)
+      - name: Vendor miniz + CA bundle
         run: |
-          mkdir -p source
           curl -fsSL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip -o /tmp/miniz.zip
-          unzip -o /tmp/miniz.zip -d /tmp/miniz
+          unzip -o -q /tmp/miniz.zip -d /tmp/miniz
           cp /tmp/miniz/miniz.c /tmp/miniz/miniz.h source/
-          # Static build: stub the CMake-generated export header.
           echo '#define MINIZ_EXPORT' > source/miniz_export.h
-
-      - name: Vendor CA bundle (for TLS verification)
-        run: |
-          mkdir -p romfs
           curl -fsSL https://curl.se/ca/cacert.pem -o romfs/cacert.pem
+
+      - name: Swap payload (TegraExplorer, GPL-2.0)
+        run: DEVKITARM=$DEVKITPRO/devkitARM sh tools/build_payload.sh /tmp/te romfs/swap_payload.bin
 
       - name: Build
         run: make -j$(nproc)

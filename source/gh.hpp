@@ -12,13 +12,15 @@ struct Asset {
 
 struct Release {
     std::string tag;
+    std::string published;   // ISO 8601
+    std::string body;        // markdown
     std::vector<Asset> assets;
 };
 
-// Fetches latest release metadata for "owner/repo".
 bool latest(const std::string& owner_repo, Release& out, std::string& err);
-
-// Fetches up to the first page (~30) of releases for "owner/repo".
 bool releases(const std::string& owner_repo, std::vector<Release>& out, std::string& err);
+
+// "2026-10-16T00:05:51Z" -> "Oct 16, 2026"
+std::string pretty_date(const std::string& iso);
 
 }

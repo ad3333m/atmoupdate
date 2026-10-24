@@ -6,3 +6,6 @@ source/miniz.h
 source/miniz.c
 source/miniz_export.h
 romfs/cacert.pem
+romfs/swap_payload.bin
+preview/
+preview_bin

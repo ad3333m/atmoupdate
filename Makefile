@@ -18,7 +18,7 @@ INCLUDES    := source
 ROMFS       := romfs
 APP_TITLE   := AtmoUpdate
 APP_AUTHOR  := Adam
-APP_VERSION := 1.0.0
+APP_VERSION := 1.1.0
 ifneq ($(wildcard $(TOPDIR)/icon.jpg),)
 ICON        := icon.jpg
 endif

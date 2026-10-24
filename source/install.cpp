@@ -4,8 +4,8 @@
 #include <dirent.h>
 #include <cerrno>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <switch.h>
 
@@ -13,29 +13,46 @@ namespace {
 
 constexpr const char* kSavedPath = "sdmc:/switch/AtmoUpdate/versions.ini";
 
+// Held open by Atmosphère while it runs; the swap payload renames *.aio over them at boot.
+bool locked_by_ams(const std::string& rel) {
+    return rel == "atmosphere/package3" || rel == "atmosphere/stratosphere.romfs";
+}
+
 bool ensure_dir(const std::string& dir) {
     if (dir.empty() || dir == "sdmc:" || dir == "sdmc:/") return true;
     struct stat st{};
-    if (stat(dir.c_str(), &st) == 0) return (st.st_mode & S_IFDIR) != 0;
-    // recurse
+    if (stat(dir.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
     size_t slash = dir.find_last_of('/');
-    if (slash != std::string::npos && slash > 5) {
-        if (!ensure_dir(dir.substr(0, slash))) return false;
-    }
+    if (slash != std::string::npos && slash > 5 && !ensure_dir(dir.substr(0, slash))) return false;
     return mkdir(dir.c_str(), 0777) == 0 || errno == EEXIST;
 }
 
-std::string sd_path(const std::string& inside_zip, const std::string& root) {
+std::string strip_lead(const std::string& p) {
     size_t i = 0;
-    while (i < inside_zip.size() && (inside_zip[i] == '/' || inside_zip[i] == '.')) i++;
-    std::string r = root;
-    if (r.empty() || r.back() != '/') r += '/';
-    return r + inside_zip.substr(i);
+    while (i < p.size() && (p[i] == '/' || p[i] == '.')) i++;
+    return p.substr(i);
+}
+
+std::vector<int> ver_parts(const std::string& v) {
+    std::vector<int> out;
+    int cur = 0; bool any = false;
+    for (char ch : v) {
+        if (ch >= '0' && ch <= '9') { cur = cur * 10 + (ch - '0'); any = true; }
+        else if (ch == '.') { out.push_back(cur); cur = 0; any = false; }
+        else break;
+    }
+    if (any) out.push_back(cur);
+    return out;
 }
 
 }
 
 namespace install {
+
+bool exists(const std::string& path) {
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0;
+}
 
 bool mkdirs_for(const std::string& path) {
     size_t slash = path.find_last_of('/');
@@ -53,61 +70,49 @@ bool is_zip(const std::string& path) {
 }
 
 bool extract_zip_to(const std::string& zip_path, const std::string& dest_root,
-                    const LogFn& log, std::string& err) {
+                    int& staged, std::string& err) {
+    staged = 0;
+    std::string root = dest_root;
+    if (root.empty() || root.back() != '/') root += '/';
+    const bool sd_root = (root == "sdmc:/");
+
     mz_zip_archive zip{};
-    if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0)) {
-        err = "bad zip";
-        return false;
-    }
+    if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0)) { err = "Bad zip file"; return false; }
+
+    std::vector<unsigned char> buf(256 * 1024);
     unsigned n = mz_zip_reader_get_num_files(&zip);
     for (unsigned i = 0; i < n; i++) {
         mz_zip_archive_file_stat st{};
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
-        std::string name = st.m_filename;
-        if (name.empty()) continue;
-        std::string dest = sd_path(name, dest_root);
-        if (st.m_is_directory || dest.back() == '/') {
-            ensure_dir(dest);
-            continue;
-        }
+        std::string rel = strip_lead(st.m_filename);
+        if (rel.empty() || rel.find("..") != std::string::npos) continue;
+        std::string dest = root + rel;
+        if (st.m_is_directory || dest.back() == '/') { ensure_dir(dest); continue; }
+
+        if (sd_root && locked_by_ams(rel)) { dest += ".aio"; staged++; }
         mkdirs_for(dest);
-        // Clear FAT read-only bit (atmosphere/package3 ships read-only in the zip)
-        // then remove. Both are best-effort; the open below decides success.
-        chmod(dest.c_str(), 0666);
-        std::remove(dest.c_str());
 
         FILE* f = std::fopen(dest.c_str(), "wb");
         if (!f) {
-            int saved = errno;
-            err = "open " + name + " errno=" + std::to_string(saved);
+            err = "Can't write " + rel + " (errno " + std::to_string(errno) + ")";
             mz_zip_reader_end(&zip);
             return false;
         }
         auto* it = mz_zip_reader_extract_iter_new(&zip, i, 0);
-        if (!it) {
-            std::fclose(f); std::remove(dest.c_str());
-            err = std::string("iter: ") + name + " (" + mz_zip_get_error_string(mz_zip_get_last_error(&zip)) + ")";
-            mz_zip_reader_end(&zip);
-            return false;
+        bool ok = it != nullptr;
+        while (ok) {
+            size_t got = mz_zip_reader_extract_iter_read(it, buf.data(), buf.size());
+            if (got == 0) break;
+            ok = std::fwrite(buf.data(), 1, got, f) == got;
         }
-        constexpr size_t BS = 128 * 1024;
-        std::vector<unsigned char> buf(BS);
-        bool ok = true;
-        for (;;) {
-            size_t n = mz_zip_reader_extract_iter_read(it, buf.data(), buf.size());
-            if (n == 0) break;
-            if (std::fwrite(buf.data(), 1, n, f) != n) { ok = false; break; }
-        }
-        mz_zip_reader_extract_iter_free(it);
-        std::fflush(f);
-        std::fclose(f);
+        if (it) mz_zip_reader_extract_iter_free(it);
+        if (std::fclose(f) != 0) ok = false;
         if (!ok) {
             std::remove(dest.c_str());
-            err = "write failed: " + name;
+            err = "Write failed: " + rel + " (SD full?)";
             mz_zip_reader_end(&zip);
             return false;
         }
-        if (log && (i % 32 == 0)) log(name);
     }
     mz_zip_reader_end(&zip);
     return true;
@@ -115,17 +120,18 @@ bool extract_zip_to(const std::string& zip_path, const std::string& dest_root,
 
 bool copy_file(const std::string& src, const std::string& dst, std::string& err) {
     FILE* a = std::fopen(src.c_str(), "rb");
-    if (!a) { err = "open src"; return false; }
+    if (!a) { err = "open " + src; return false; }
     mkdirs_for(dst);
     FILE* b = std::fopen(dst.c_str(), "wb");
-    if (!b) { std::fclose(a); err = "open dst"; return false; }
-    char buf[64 * 1024];
+    if (!b) { std::fclose(a); err = "open " + dst; return false; }
+    std::vector<char> buf(64 * 1024);
     size_t r;
-    while ((r = std::fread(buf, 1, sizeof(buf), a)) > 0) {
-        if (std::fwrite(buf, 1, r, b) != r) { std::fclose(a); std::fclose(b); err = "write"; return false; }
-    }
-    std::fclose(a); std::fclose(b);
-    return true;
+    bool ok = true;
+    while (ok && (r = std::fread(buf.data(), 1, buf.size(), a)) > 0) ok = std::fwrite(buf.data(), 1, r, b) == r;
+    std::fclose(a);
+    if (std::fclose(b) != 0) ok = false;
+    if (!ok) err = "write " + dst;
+    return ok;
 }
 
 bool read_file(const std::string& path, std::string& out) {
@@ -146,28 +152,28 @@ bool write_file(const std::string& path, const std::string& content) {
     return true;
 }
 
+bool ams_update_pending() {
+    return exists("sdmc:/atmosphere/package3.aio") || exists("sdmc:/atmosphere/stratosphere.romfs.aio");
+}
+
 std::string detect_hekate_version() {
-    const char* dirs[] = {"sdmc:/", "sdmc:/bootloader/", "sdmc:/payloads/", "sdmc:/switch/"};
+    std::string best;
+    const char* dirs[] = {"sdmc:/", "sdmc:/bootloader/", "sdmc:/payloads/", "sdmc:/bootloader/payloads/"};
     for (const char* dp : dirs) {
         DIR* d = opendir(dp);
         if (!d) continue;
         while (auto* e = readdir(d)) {
             std::string n = e->d_name;
-            if (n.rfind("hekate_ctcaer_", 0) == 0 && n.size() > 18 && n.substr(n.size()-4) == ".bin") {
-                std::string ver = n.substr(14, n.size() - 14 - 4);
-                size_t us = ver.find('_');          // trim _Nyx_X.Y.Z suffix
-                if (us != std::string::npos) ver = ver.substr(0, us);
-                closedir(d);
-                return ver;
-            }
+            if (n.rfind("hekate_ctcaer_", 0) != 0 || n.size() < 19 || n.substr(n.size() - 4) != ".bin") continue;
+            std::string ver = n.substr(14, n.size() - 18);
+            size_t us = ver.find('_');               // _Nyx_x.y.z / __ram8GB
+            if (us != std::string::npos) ver = ver.substr(0, us);
+            if (ver_parts(ver).empty()) continue;
+            if (best.empty() || ver_parts(ver) > ver_parts(best)) best = ver;
         }
         closedir(d);
     }
-    return {};
-}
-
-bool extract_zip_to_root(const std::string& zip_path, const LogFn& log, std::string& err) {
-    return extract_zip_to(zip_path, "sdmc:/", log, err);
+    return best;
 }
 
 std::string detect_firmware_version() {
@@ -177,7 +183,7 @@ std::string detect_firmware_version() {
     setsysExit();
     if (R_FAILED(rc)) return {};
     v.display_version[sizeof(v.display_version) - 1] = '\0';
-    return std::string(v.display_version);
+    return v.display_version;
 }
 
 std::string detect_atmosphere_version() {
@@ -186,10 +192,8 @@ std::string detect_atmosphere_version() {
     Result rc = splGetConfig((SplConfigItem)65000, &ver);  // ExosphereVersion
     splExit();
     if (R_FAILED(rc)) return {};
-    unsigned major = (ver >> 56) & 0xff;
-    unsigned minor = (ver >> 48) & 0xff;
-    unsigned micro = (ver >> 40) & 0xff;
-    if (major == 0 && minor == 0 && micro == 0) return {};
+    unsigned major = (ver >> 56) & 0xff, minor = (ver >> 48) & 0xff, micro = (ver >> 40) & 0xff;
+    if (!major && !minor && !micro) return {};
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%u.%u.%u", major, minor, micro);
     return buf;
@@ -202,8 +206,7 @@ std::string read_saved(const char* key) {
     size_t at = ini.find(pat);
     if (at == std::string::npos) return {};
     size_t eol = ini.find('\n', at);
-    std::string v = ini.substr(at + pat.size(),
-                              (eol == std::string::npos ? ini.size() : eol) - (at + pat.size()));
+    std::string v = ini.substr(at + pat.size(), (eol == std::string::npos ? ini.size() : eol) - (at + pat.size()));
     while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
     return v;
 }
@@ -212,15 +215,14 @@ void write_saved(const char* key, const std::string& value) {
     std::string ini;
     read_file(kSavedPath, ini);
     std::string pat = std::string(key) + "=";
-    size_t at = ini.find(pat);
     std::string line = pat + value + "\n";
+    size_t at = ini.find(pat);
     if (at == std::string::npos) {
         if (!ini.empty() && ini.back() != '\n') ini += '\n';
         ini += line;
     } else {
         size_t eol = ini.find('\n', at);
-        if (eol == std::string::npos) eol = ini.size();
-        else eol += 1;
+        eol = (eol == std::string::npos) ? ini.size() : eol + 1;
         ini.replace(at, eol - at, line);
     }
     write_file(kSavedPath, ini);

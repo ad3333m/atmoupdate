@@ -17,7 +17,7 @@ size_t write_file(void* data, size_t n, size_t m, void* ud) {
 int xfer_cb(void* ud, curl_off_t dltotal, curl_off_t dlnow,
             curl_off_t, curl_off_t) {
     auto* p = static_cast<http::ProgressFn*>(ud);
-    if (p && *p) (*p)(static_cast<double>(dlnow), static_cast<double>(dltotal));
+    if (p && *p && !(*p)(static_cast<double>(dlnow), static_cast<double>(dltotal))) return 1;
     return 0;
 }
 
@@ -42,6 +42,7 @@ bool get_string(const std::string& url, std::string& out, std::string& err) {
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_string);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 25L);
     common_opts(c);
     CURLcode r = curl_easy_perform(c);
     long code = 0;
